@@ -1,0 +1,20 @@
+{
+  "expo": {
+    "name": "Discord Switcher",
+    "slug": "discord-switcher",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "userInterfaceStyle": "dark",
+    "ios": {
+      "supportsTablet": true,
+      "bundleIdentifier": "com.yourname.discordswitcher",
+      "infoPlist": {
+        "NSCameraUsageDescription": "Lets websites and Discord use your camera for video calls and photo uploads.",
+        "NSMicrophoneUsageDescription": "Lets websites and Discord use your microphone for voice calls.",
+        "NSAppTransportSecurity": {
+          "NSAllowsArbitraryLoadsInWebContent": true
+        }
+      }
+    }
+  }
+}
