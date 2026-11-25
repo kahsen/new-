@@ -1,0 +1,132 @@
+# UNTESTED: builds an unsigned .ipa on GitHub's free macOS runner (Node 24).
+# Install it with Sideloadly or AltStore (free Apple ID = re-sign every 7 days).
+# If something fails, the real error lines are shown in the run's "Annotations" list.
+name: Build IPA
+on: workflow_dispatch
+jobs:
+  build:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - run: node --version && npm --version && xcodebuild -version
+      - run: npm install --no-audit --no-fund
+      - run: npx expo install --fix
+
+      - name: Show webview library layout (diagnostics)
+        continue-on-error: true
+        run: |
+          find node_modules/react-native-webview -maxdepth 2 -type d | head -30
+          grep -rln "WKWebViewConfiguration" node_modules/react-native-webview --include=*.m --include=*.mm --include=*.h | head
+
+      - name: Patch react-native-webview for separate saved logins per tab (best effort)
+        id: patch
+        continue-on-error: true
+        run: |
+          python3 - <<'PY'
+          import re, glob, sys, os
+          base = 'node_modules/react-native-webview'
+          def out(v):
+              with open(os.environ['GITHUB_OUTPUT'], 'a') as f: f.write('applied=' + v + '\n')
+          target = None
+          for f in glob.glob(base + '/**/*', recursive=True):
+              if f.endswith(('.m', '.mm')) and '/example' not in f:
+                  src = open(f, errors='ignore').read()
+                  if re.search(r'\[\s*WKWebViewConfiguration\s+new\s*\]|\[\[\s*WKWebViewConfiguration\s+alloc\s*\]\s*init\s*\]', src):
+                      target = f; break
+          if not target:
+              print('::warning::No file creating WKWebViewConfiguration found; skipping login patch')
+              out('false'); sys.exit(0)
+          src = open(target, errors='ignore').read()
+          if 'RNTAB/' in src:
+              print('Already patched'); out('true'); sys.exit(0)
+          m = re.search(r'(\w+)\s*=\s*\[\s*WKWebViewConfiguration\s+new\s*\]|(\w+)\s*=\s*\[\[\s*WKWebViewConfiguration\s+alloc\s*\]\s*init\s*\]', src)
+          var = m.group(1) or m.group(2)
+          r = re.search(r'return\s+' + re.escape(var) + r'\s*;', src[m.end():])
+          if not r:
+              print('::warning::return of config not found; skipping login patch')
+              out('false'); sys.exit(0)
+          pos = m.end() + r.start()
+          block = '''  if (@available(iOS 17.0, *)) {
+              if ([self respondsToSelector:@selector(applicationNameForUserAgent)]) {
+                NSString *rnApp = [self valueForKey:@"applicationNameForUserAgent"];
+                NSRange rnRange = (rnApp != nil) ? [rnApp rangeOfString:@"RNTAB/"] : NSMakeRange(NSNotFound, 0);
+                if (rnRange.location != NSNotFound) {
+                  NSString *rnTail = [rnApp substringFromIndex:rnRange.location + rnRange.length];
+                  if (rnTail.length >= 36) {
+                    NSUUID *rnUUID = [[NSUUID alloc] initWithUUIDString:[rnTail substringToIndex:36]];
+                    if (rnUUID != nil) {
+                      VAR.websiteDataStore = [WKWebsiteDataStore dataStoreForIdentifier:rnUUID];
+                    }
+                  }
+                }
+              }
+            }
+            '''.replace('VAR', var)
+          open(target, 'w').write(src[:pos] + block + src[pos:])
+          print('PATCHED', target, 'variable', var)
+          out('true')
+          PY
+
+      - name: Check JS bundle (shows real script errors)
+        continue-on-error: true
+        run: |
+          npx expo export --platform ios --output-dir "$RUNNER_TEMP/export" > "$RUNNER_TEMP/export.log" 2>&1 || {
+            tail -n 25 "$RUNNER_TEMP/export.log" | while IFS= read -r l; do echo "::error::${l:0:240}"; done
+            exit 1
+          }
+
+      - run: npx expo prebuild --platform ios
+        env:
+          CI: "1"
+
+      - name: Create build script
+        run: |
+          cat > "$RUNNER_TEMP/build.sh" <<'SH'
+          WS=$(ls -d ios/*.xcworkspace | head -1)
+          SCHEME=$(basename "$WS" .xcworkspace)
+          rm -rf build Payload app.ipa
+          xcodebuild -workspace "$WS" -scheme "$SCHEME" -configuration Release \
+            -sdk iphoneos -destination 'generic/platform=iOS' -derivedDataPath build \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \
+            > "$RUNNER_TEMP/xcodebuild.log" 2>&1
+          code=$?
+          if [ $code -ne 0 ]; then
+            grep -E "error:|BUILD FAILED|PhaseScriptExecution failed" "$RUNNER_TEMP/xcodebuild.log" | head -15 | while IFS= read -r l; do echo "::error::${l:0:240}"; done
+            exit $code
+          fi
+          mkdir Payload && cp -R build/Build/Products/Release-iphoneos/*.app Payload/
+          zip -qr app.ipa Payload
+          SH
+
+      - name: Build unsigned IPA
+        id: build_main
+        continue-on-error: true
+        run: bash "$RUNNER_TEMP/build.sh"
+
+      - name: Fallback - rebuild WITHOUT the login patch
+        id: build_fallback
+        if: steps.build_main.outcome == 'failure' && steps.patch.outputs.applied == 'true'
+        run: |
+          echo "::warning::Build failed with the login patch; rebuilding WITHOUT it (use Discord login slots or Temporary login storage)."
+          rm -rf node_modules/react-native-webview
+          npm install --no-audit --no-fund
+          bash "$RUNNER_TEMP/build.sh"
+
+      - name: Stop if both builds failed
+        if: steps.build_main.outcome == 'failure' && steps.build_fallback.outcome != 'success'
+        run: exit 1
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: app-ipa
+          path: app.ipa
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: xcodebuild-log
+          path: ${{ runner.temp }}/xcodebuild.log
+          if-no-files-found: ignore
